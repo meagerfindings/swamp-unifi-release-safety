@@ -1,0 +1,13 @@
+# Swamp runtime/cache data
+.swamp/
+unifi-cve-state.json
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/

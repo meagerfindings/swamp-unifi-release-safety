@@ -1,0 +1,23 @@
+manifestVersion: 1
+name: "@mgreten/unifi-cve-watcher"
+version: "2026.06.13.1"
+description: >
+  Checks official Ubiquiti Security Advisory Bulletins plus NVD and GitHub
+  Advisory DB for UniFi/Ubiquiti HIGH/CRITICAL CVEs. It emits an alert only
+  for newly discovered findings and persists state for idempotency.
+repository: https://github.com/meagerfindings/swamp-unifi-release-safety
+
+paths:
+  base: manifest
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+  - references/silent-mode.md
+
+models:
+  - model.ts
+
+platforms:
+  - linux-x86_64
+  - darwin-aarch64
