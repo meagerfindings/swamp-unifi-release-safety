@@ -1,544 +1,501 @@
 /**
- * UniFi/Ubiquiti CVE watcher.
+ * UniFi firmware release-safety discovery model.
  *
- * Monitors official Ubiquiti Security Advisory Bulletins first, then augments
- * with NVD and GitHub Advisory DB. Official bulletins are authoritative because
- * they often appear before NVD/GitHub entries and include per-product fixed
- * version thresholds.
+ * Two independent, read-only collection modes feed the same deduplicated
+ * review pipeline:
+ *  - `scan`: reads Home Assistant's UniFi firmware update entities.
+ *  - `observe`: records caller-supplied model/version observations for
+ *    callers without Home Assistant (no network request, no credentials).
+ *
+ * Both modes share the same dedupe key strategy and the same initial plus
+ * 7/14/21-day review-scheduling logic. It never installs updates or changes
+ * Home Assistant/UniFi configuration.
  *
  * @module
  */
-
 import { z } from "npm:zod@4";
 
-const DEFAULT_KEYWORDS = [
-  "ubiquiti",
-  "unifi",
-  "dream machine",
-  "udm",
-  "udm pro",
-];
-
-const CHECK_ARGS = z.object({
-  keywords: z.array(z.string()).optional(),
-  maxResults: z.number().int().positive().max(100).optional().describe(
-    "Max advisory/CVE records per source (default 20)",
+const GlobalArgs = z.object({
+  homeAssistantUrl: z.string().url().optional().describe(
+    "Home Assistant base URL; only required to call scan",
   ),
-  includeDetails: z.boolean().optional().describe(
-    "Include CVE descriptions and references",
+  homeAssistantToken: z.string().meta({ sensitive: true }).optional().describe(
+    "Read-only Home Assistant long-lived access token; only required to call scan",
   ),
-  currentProduct: z.string().optional().describe(
-    "Product to evaluate, e.g. UDM-Pro",
-  ),
-  currentVersion: z.string().optional().describe(
-    "Currently installed UniFi OS/app version for product-aware status",
+  entityIds: z.array(z.string()).optional().describe(
+    "Explicit Home Assistant firmware-update entity IDs to monitor; only required to call scan",
   ),
 });
 
-const CVE_SCHEMA = z.object({
-  cve_id: z.string(),
-  description: z.string(),
-  severity_score: z.number(),
-  severity: z.enum(["HIGH", "CRITICAL"]),
-  source: z.enum(["UBIQUITI", "NVD", "GITHUB"]),
-  published: z.string(),
-  bulletin: z.string().optional(),
-  affectedProducts: z.string().optional(),
-  mitigation: z.string().optional(),
-  fixedVersion: z.string().optional(),
-  currentProduct: z.string().optional(),
-  currentVersion: z.string().optional(),
-  currentStatus: z.enum(["patched", "affected", "unknown", "not_applicable"])
-    .optional(),
-  references: z.array(z.string()),
+const ReleaseSchema = z.object({
+  key: z.string(),
+  source: z.enum(["homeAssistant", "direct"]).default("homeAssistant"),
+  entityId: z.string().optional(),
+  model: z.string().optional(),
+  deviceId: z.string().optional(),
+  deviceName: z.string(),
+  installedVersion: z.string(),
+  targetVersion: z.string(),
+  releaseUrl: z.string().url().optional(),
+  firstSeenAt: z.string(),
+  lastSeenAt: z.string(),
+  lastNotifiedStage: z.enum(["initial", "day7", "day14", "day21"]).optional(),
+  nextReviewAt: z.string().optional(),
 });
 
-const CHECK_OUTPUT = z.object({
-  alertText: z.string().describe(
-    "Human-readable alert (empty string when nothing new)",
-  ),
-  newCVEs: z.array(CVE_SCHEMA).describe("New CVEs discovered this check"),
-  totalScanned: z.number().describe("Total CVEs in scope for this run"),
-  timestamp: z.string().describe("ISO timestamp of the check"),
+const ReviewCandidateSchema = ReleaseSchema.extend({
+  stage: z.enum(["initial", "day7", "day14", "day21"]),
+  researchRequired: z.boolean(),
+  rationale: z.string(),
 });
 
-type WatchState = {
-  lastCheck: string | null;
-  checkedCves: string[];
+const ReportSchema = z.object({
+  scannedAt: z.string(),
+  firmwareEntitiesScanned: z.number().int().nonnegative().optional(),
+  directObservationsRecorded: z.number().int().nonnegative().optional(),
+  availableUpdates: z.array(ReleaseSchema),
+  reviewCandidates: z.array(ReviewCandidateSchema),
+  staleReleaseKeys: z.array(z.string()),
+  summary: z.string(),
+});
+
+type Release = z.infer<typeof ReleaseSchema>;
+type Report = z.infer<typeof ReportSchema>;
+type Stage = z.infer<typeof ReviewCandidateSchema>["stage"];
+
+type MethodContext = {
+  globalArgs: z.infer<typeof GlobalArgs>;
+  logger: {
+    info: (message: string, properties?: Record<string, unknown>) => void;
+  };
+  readResource?: (name: string) => Promise<unknown>;
+  writeResource: (
+    resourceName: string,
+    instanceName: string,
+    value: Report,
+  ) => Promise<unknown>;
 };
 
-type Finding = z.infer<typeof CVE_SCHEMA>;
+type HaState = {
+  entity_id?: unknown;
+  state?: unknown;
+  attributes?: Record<string, unknown>;
+};
 
-/** Fetch JSON with retry/backoff. */
-async function fetchJson(url: string, opts?: RequestInit): Promise<unknown> {
-  for (let i = 0; i < 2; i++) {
-    try {
-      const resp = await fetch(url, {
-        ...opts,
-        signal: AbortSignal.timeout(8_000),
-      });
-      if (!resp.ok) continue;
-      return (await resp.json()) as unknown;
-    } catch {
-      await new Promise((r) => setTimeout(r, 2 ** i * 500));
-    }
+const REVIEW_DAYS: Record<Stage, number> = {
+  initial: 0,
+  day7: 7,
+  day14: 14,
+  day21: 21,
+};
+
+function isoAfter(start: string, days: number): string {
+  return new Date(new Date(start).getTime() + days * 86_400_000).toISOString();
+}
+
+function nextStage(stage: Stage): Stage | undefined {
+  return stage === "initial"
+    ? "day7"
+    : stage === "day7"
+    ? "day14"
+    : stage === "day14"
+    ? "day21"
+    : undefined;
+}
+
+function stageDue(release: Release, now: Date): Stage | undefined {
+  const next: Stage | undefined = release.lastNotifiedStage === undefined
+    ? "initial"
+    : nextStage(release.lastNotifiedStage);
+  if (!next) return undefined;
+  return now >= new Date(isoAfter(release.firstSeenAt, REVIEW_DAYS[next]))
+    ? next
+    : undefined;
+}
+
+function reviewCandidatesFor(
+  releases: Release[],
+  now: Date,
+): z.infer<typeof ReviewCandidateSchema>[] {
+  const candidates: z.infer<typeof ReviewCandidateSchema>[] = [];
+  for (const release of releases) {
+    const stage = stageDue(release, now);
+    if (!stage) continue;
+    const upcoming = nextStage(stage);
+    const nextReviewAt = upcoming
+      ? isoAfter(release.firstSeenAt, REVIEW_DAYS[upcoming])
+      : undefined;
+    candidates.push({
+      ...release,
+      nextReviewAt,
+      stage,
+      researchRequired: true,
+      rationale: stage === "initial"
+        ? "New firmware target detected; verify official support and early reports."
+        : `Scheduled ${stage} safety reassessment for the same firmware target.`,
+    });
   }
-  return null;
+  return candidates;
 }
 
-/** Load persisted state from local JSON, accepting old snake_case state too. */
-async function loadState(repoDir: string): Promise<WatchState> {
-  const statePath = `${repoDir}/unifi-cve-state.json`;
-  try {
-    const raw = await Deno.readTextFile(statePath);
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    return {
-      lastCheck: (parsed.lastCheck ?? parsed.last_check ?? null) as
-        | string
-        | null,
-      checkedCves:
-        (parsed.checkedCves ?? parsed.checked_cves ?? []) as string[],
-    };
-  } catch {
-    return { lastCheck: null, checkedCves: [] };
+function firmwareUpdateFromState(
+  item: HaState,
+  now: string,
+): Release | undefined {
+  const entityId = typeof item.entity_id === "string" ? item.entity_id : "";
+  const attributes = item.attributes ?? {};
+  if (item.state !== "on" || attributes.device_class !== "firmware") {
+    return undefined;
   }
-}
-
-/** Save state for next-run deduplication. */
-async function saveState(repoDir: string, data: WatchState): Promise<void> {
-  await Deno.writeTextFile(
-    `${repoDir}/unifi-cve-state.json`,
-    JSON.stringify(
-      {
-        lastCheck: data.lastCheck,
-        checkedCves: data.checkedCves,
-        last_check: data.lastCheck,
-        checked_cves: data.checkedCves,
-      },
-      null,
-      2,
-    ),
-  );
-}
-
-/** Convert minimal HTML advisory content to readable text. */
-function htmlToText(html: string): string {
-  return html
-    .replace(/<br\s*\/?\s*>/gi, "\n")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<\/li>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+\n/g, "\n")
-    .replace(/\n\s+/g, "\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim();
-}
-
-/** Compare dotted version strings. Returns -1/0/1. */
-function compareVersions(left: string, right: string): number {
-  const a = left.split(/[.+-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const b = right.split(/[.+-]/).map((part) => Number.parseInt(part, 10) || 0);
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const diff = (a[i] ?? 0) - (b[i] ?? 0);
-    if (diff < 0) return -1;
-    if (diff > 0) return 1;
+  const installedVersion = typeof attributes.installed_version === "string"
+    ? attributes.installed_version
+    : "";
+  const targetVersion = typeof attributes.latest_version === "string"
+    ? attributes.latest_version
+    : "";
+  if (
+    !entityId || !installedVersion || !targetVersion ||
+    installedVersion === targetVersion
+  ) {
+    return undefined;
   }
-  return 0;
-}
-
-/** Return true when an ISO-ish publication date is within the last two years. */
-function isRecentIso(dateText: string): boolean {
-  if (!dateText) return false;
-  const parsed = new Date(dateText);
-  if (Number.isNaN(parsed.getTime())) return false;
-  const cutoff = new Date();
-  cutoff.setFullYear(cutoff.getFullYear() - 2);
-  return parsed >= cutoff;
-}
-
-/** Extract text after a label until the next major label. */
-function extractLabeled(section: string, label: string): string {
-  const re = new RegExp(
-    `${label}:?\\s*([\\s\\S]*?)(?=Affected Products:?|Mitigation:?|Impact:?|CVSS|Base Score|Vector:?|CVE:?|Note:|$)`,
-    "i",
-  );
-  return section.match(re)?.[1]?.replace(/\s+/g, " ").trim() ?? "";
-}
-
-/** Find the fixed version most relevant to a product in the mitigation text. */
-function fixedVersionForProduct(
-  mitigation: string,
-  product: string,
-): string | undefined {
-  const normalizedProduct = product.toLowerCase();
-  const sentences = mitigation.split(/(?<=\.)\s+/);
-  const relevant =
-    sentences.find((sentence) =>
-      sentence.toLowerCase().includes(normalizedProduct)
-    ) ?? sentences[0] ?? mitigation;
-  return relevant.match(/Version\s+([0-9]+(?:\.[0-9]+){1,3})\s+or\s+later/i)
-    ?.[1];
-}
-
-/** Determine whether the provided current product/version is affected. */
-function currentStatus(
-  affectedProducts: string,
-  mitigation: string,
-  currentProduct?: string,
-  currentVersion?: string,
-): { status?: Finding["currentStatus"]; fixedVersion?: string } {
-  if (!currentProduct) return {};
-  const product = currentProduct.toLowerCase();
-  if (!affectedProducts.toLowerCase().includes(product)) {
-    return { status: "not_applicable" };
-  }
-  if (!currentVersion) return { status: "unknown" };
-  const fixedVersion = fixedVersionForProduct(mitigation, currentProduct);
-  if (!fixedVersion) return { status: "unknown" };
+  const deviceName = typeof attributes.friendly_name === "string"
+    ? attributes.friendly_name
+    : entityId;
+  const releaseUrl = typeof attributes.release_url === "string" &&
+      /^https?:\/\//.test(attributes.release_url)
+    ? attributes.release_url
+    : undefined;
   return {
-    fixedVersion,
-    status: compareVersions(currentVersion, fixedVersion) >= 0
-      ? "patched"
-      : "affected",
+    key: `${entityId}:${installedVersion}->${targetVersion}`,
+    source: "homeAssistant",
+    entityId,
+    deviceName,
+    installedVersion,
+    targetVersion,
+    releaseUrl,
+    firstSeenAt: now,
+    lastSeenAt: now,
   };
 }
 
-/** Parse one official Ubiquiti release/bulletin into CVE findings. */
-function parseUbiquitiBulletin(
-  item: Record<string, unknown>,
-  currentProduct?: string,
-  currentVersion?: string,
-): Finding[] {
-  const notes =
-    (item.importantNotes as Array<Record<string, string>> | undefined) ?? [];
-  const html = notes.map((note) => note.content ?? "").join("\n");
-  const text = htmlToText(html);
-  const published = text.match(/Published:\s*([^\n]+)/i)?.[1]?.trim() ??
-    (item.createdAt as string | undefined) ?? "";
-  const bulletin = `${item.title as string} (${item.version as string})`;
-  const url = `https://community.ui.com/releases/${item.slug as string}/${item
-    .id as string}`;
+const ObservationSchema = z.object({
+  model: z.string().min(1).describe(
+    "Device hardware/software model identifier, e.g. a UniFi model name",
+  ),
+  installedVersion: z.string().min(1).describe(
+    "Currently installed firmware version",
+  ),
+  targetVersion: z.string().min(1).describe(
+    "Offered or available target firmware version",
+  ),
+  deviceId: z.string().min(1).optional().describe(
+    "Optional caller-defined device identifier; used for deduplication instead of model when present",
+  ),
+  releaseUrl: z.string().url().optional().describe(
+    "Optional URL to release notes or changelog for the target version",
+  ),
+});
 
-  const sections = text.split(/Summary\s+\d+\s+of\s+\d+/i).slice(1);
-  const findings: Finding[] = [];
-  for (const section of sections) {
-    const cves = [...section.matchAll(/CVE-\d{4}-\d{4,}/g)].map((m) => m[0]);
-    if (cves.length === 0) continue;
-
-    const affectedProducts = extractLabeled(section, "Affected Products");
-    const mitigation = extractLabeled(section, "Mitigation");
-    const base = section.match(/Base Score:\s*([0-9.]+)\s*(Critical|High)/i);
-    const score = Number.parseFloat(base?.[1] ?? "0");
-    const severity =
-      (base?.[2]?.toUpperCase() === "CRITICAL" ? "CRITICAL" : "HIGH") as
-        | "HIGH"
-        | "CRITICAL";
-    const description = section
-      .split(/Affected Products:?/i)[0]
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 500);
-    const status = currentStatus(
-      affectedProducts,
-      mitigation,
-      currentProduct,
-      currentVersion,
-    );
-
-    for (const cveId of new Set(cves)) {
-      findings.push({
-        cve_id: cveId,
-        description,
-        severity_score: score,
-        severity,
-        source: "UBIQUITI",
-        published,
-        bulletin,
-        affectedProducts,
-        mitigation,
-        fixedVersion: status.fixedVersion,
-        currentProduct,
-        currentVersion,
-        currentStatus: status.status,
-        references: [url, `https://www.cve.org/CVERecord?id=${cveId}`],
-      });
-    }
-  }
-  return findings;
+function directObservationRelease(
+  entry: z.infer<typeof ObservationSchema>,
+  now: string,
+): Release | undefined {
+  const model = entry.model.trim();
+  const installedVersion = entry.installedVersion.trim();
+  const targetVersion = entry.targetVersion.trim();
+  if (!model || !installedVersion || !targetVersion) return undefined;
+  if (installedVersion === targetVersion) return undefined;
+  const deviceId = entry.deviceId?.trim() || undefined;
+  const identifier = deviceId ?? model;
+  return {
+    key: `direct:${identifier}:${installedVersion}->${targetVersion}`,
+    source: "direct",
+    model,
+    deviceId,
+    deviceName: deviceId ?? model,
+    installedVersion,
+    targetVersion,
+    releaseUrl: entry.releaseUrl,
+    firstSeenAt: now,
+    lastSeenAt: now,
+  };
 }
 
-/** Query official Ubiquiti Community Security Advisory Bulletins. */
-async function queryUbiquitiBulletins(
-  maxResults: number,
-  currentProduct?: string,
-  currentVersion?: string,
-): Promise<Finding[]> {
-  const query = `
-    query GetReleases($limit: Int, $searchTerm: String, $sortBy: ReleasesSortBy) {
-      releases(limit: $limit, searchTerm: $searchTerm, sortBy: $sortBy) {
-        items {
-          id
-          title
-          slug
-          version
-          createdAt
-          updatedAt
-          tags
-          importantNotes { type ... on TextContent { content } }
-        }
-      }
-    }
-  `;
-  const data = await fetchJson("https://community.svc.ui.com/", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "origin": "https://community.ui.com",
-      "referer": "https://community.ui.com/",
-    },
-    body: JSON.stringify({
-      query,
-      variables: {
-        limit: Math.min(maxResults, 50),
-        searchTerm: "Security Advisory Bulletin",
-        sortBy: "LATEST",
-      },
-    }),
-  }) as Record<string, unknown> | null;
+const ObserveArgs = z.object({
+  observations: z.array(ObservationSchema).min(1).describe(
+    "Caller-supplied model/installed-version/target-version observations, gathered without Home Assistant",
+  ),
+});
 
-  const releases =
-    ((data?.data as Record<string, unknown> | undefined)?.releases as
-      | Record<string, unknown>
-      | undefined)?.items as Record<string, unknown>[] | undefined;
-  if (!releases) return [];
-  return releases.flatMap((item) =>
-    parseUbiquitiBulletin(item, currentProduct, currentVersion)
-  );
-}
+const AcknowledgementArgs = z.object({
+  acknowledgements: z.array(z.object({
+    key: z.string(),
+    stage: z.enum(["initial", "day7", "day14", "day21"]),
+  })).min(1).describe(
+    "Review candidates delivered to the user after research",
+  ),
+});
 
-/** Query NVD REST API for CVEs matching keywords. */
-async function queryNvd(
-  keywords: string[],
-  maxResults: number,
-): Promise<Finding[]> {
-  const queries = [
-    "ubiquiti unifi",
-    "unifi os",
-    "dream machine",
-    "unifi network",
-  ];
-  const keywordSet = new Set(keywords.map((k) => k.toLowerCase()));
-  const findings: Finding[] = [];
-
-  for (const q of queries) {
-    const encoded = encodeURIComponent(q);
-    const url =
-      `https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=${encoded}&resultsPerPage=${maxResults}`;
-    const data = await fetchJson(url) as Record<string, unknown> | null;
-    const vulns = data?.vulnerabilities as unknown[] | undefined;
-    if (!vulns) continue;
-
-    for (const vuln of vulns) {
-      const cve = (vuln as Record<string, unknown>).cve as
-        | Record<string, unknown>
-        | undefined;
-      if (!cve) continue;
-      const descriptions = (cve.descriptions as unknown[] ?? []) as Record<
-        string,
-        string
-      >[];
-      const desc = descriptions.at(0)?.value ?? "";
-      if (!Array.from(keywordSet).some((k) => desc.toLowerCase().includes(k))) {
-        continue;
-      }
-      const cveYear = Number.parseInt(
-        String(cve.id ?? "").match(/^CVE-(\d{4})-/)?.[1] ?? "0",
-        10,
-      );
-      if (!cveYear || cveYear < new Date().getFullYear() - 1) continue;
-      const published = (cve.published as string | undefined) ??
-        (cve.publishedDate as string | undefined) ?? "";
-      if (!isRecentIso(published)) continue;
-
-      const metrics = (cve.metrics as Record<string, unknown>) ?? {};
-      const allMetrics = [
-        ...((metrics.cvssMetricV31 as unknown[]) ?? []),
-        ...((metrics.cvssMetricV30 as unknown[]) ?? []),
-      ];
-      const firstMetric = allMetrics[0] as Record<string, unknown> | undefined;
-      const cvss = firstMetric?.cvssData as Record<string, string> | undefined;
-      const severity = cvss?.baseSeverity ?? "";
-      if (severity !== "HIGH" && severity !== "CRITICAL") continue;
-
-      findings.push({
-        cve_id: cve.id as string,
-        description: desc.slice(0, 500),
-        severity_score: Number.parseFloat(cvss?.baseScore ?? "0"),
-        severity: severity as "HIGH" | "CRITICAL",
-        source: "NVD",
-        published,
-        references: (cve.references as unknown[] ?? [])
-          .map((r) => (r as Record<string, string>)?.url ?? "")
-          .filter((r) => r),
-      });
-    }
-  }
-  return findings;
-}
-
-/** Query GitHub Advisory DB for advisories matching keywords. */
-async function queryGithubAdvisories(keywords: string[]): Promise<Finding[]> {
-  const data = await fetchJson(
-    "https://api.github.com/advisories?per_page=100",
-    {
-      headers: { Accept: "application/vnd.github+json" },
-    },
-  ) as unknown;
-  if (!Array.isArray(data)) return [];
-
-  const keywordSet = new Set(keywords.map((k) => k.toLowerCase()));
-  const findings: Finding[] = [];
-  for (const adv of data.slice(0, 100)) {
-    const advObj = adv as Record<string, unknown>;
-    const comb = `${advObj.title ?? ""} ${advObj.summary ?? ""}`.toLowerCase();
-    if (!Array.from(keywordSet).some((k) => comb.includes(k))) continue;
-    const severity = String(advObj.severity ?? "");
-    if (severity !== "critical" && severity !== "high") continue;
-    findings.push({
-      cve_id: String(advObj.cve_id ?? `GHSA-${advObj.id}`),
-      description: String(advObj.summary ?? "").slice(0, 500),
-      severity_score: severity === "critical" ? 9.0 : 7.5,
-      severity: severity.toUpperCase() as "HIGH" | "CRITICAL",
-      source: "GITHUB",
-      published: String(advObj.published_at ?? ""),
-      references: ((advObj.references as unknown[] | undefined) ?? [])
-        .map((r) => (r as Record<string, string>)?.url ?? "")
-        .filter((r) => r),
-    });
-  }
-  return findings;
-}
-
-/** Format alert text for new CVEs. */
-function formatAlert(newCves: Finding[], timestamp: string): string {
-  if (newCves.length === 0) return "";
-
-  let text = "# UNIFI/UBIQUITI CVE WATCH ALERT\n\n";
-  text += `Checked: ${timestamp}\n`;
-  text += `New HIGH/CRITICAL CVEs/advisories: ${newCves.length}\n\n`;
-
-  const sorted = [...newCves].sort((a, b) =>
-    b.severity_score - a.severity_score
-  );
-  for (const cve of sorted) {
-    const emoji = cve.severity === "CRITICAL" ? "RED" : "ORANGE";
-    text +=
-      `${emoji} **${cve.cve_id}** (${cve.severity}, score ${cve.severity_score})`;
-    if (cve.source === "UBIQUITI" && cve.bulletin) text += ` — ${cve.bulletin}`;
-    text += "\n";
-    text += `   ${cve.description}\n`;
-    if (cve.currentStatus) {
-      text += `   Current ${cve.currentProduct ?? "product"} ${
-        cve.currentVersion ?? "version unknown"
-      }: ${cve.currentStatus}`;
-      if (cve.fixedVersion) text += ` (fixed in ${cve.fixedVersion}+)`;
-      text += "\n";
-    }
-    if (cve.references.length > 0) text += `   _${cve.references[0]}_\n`;
-    text += "\n";
-  }
-
-  text += "---\n";
-  text +=
-    "Official Ubiquiti Security Advisory Bulletins are checked before NVD/GitHub.\n";
-  text += "Next check will only alert on newly seen CVE IDs.\n";
-  return text;
-}
-
-/**
- * Model definition for checking UniFi/Ubiquiti CVE sources.
- */
+/** Model definition for read-only UniFi firmware release observation. */
 export const model = {
-  type: "@mgreten/unifi-cve-watcher",
-  version: "2026.06.13.1",
-
-  methods: {
-    run: {
+  type: "@mgreten/unifi-release-safety",
+  version: "2026.07.20.1",
+  globalArguments: GlobalArgs,
+  resources: {
+    releaseSafetyReport: {
       description:
-        "Query official Ubiquiti Security Advisory Bulletins, NVD, and GitHub Advisory DB for new UniFi/Ubiquiti HIGH/CRITICAL CVEs.",
-      arguments: CHECK_ARGS,
-      resources: {
-        results: {
-          description: "Scan results and discovered CVEs",
-          schema: CHECK_OUTPUT,
-          lifetime: "infinite",
-          garbageCollection: 0,
-        },
-      },
-      execute: async (args: z.infer<typeof CHECK_ARGS>, ctx) => {
-        const keywords = args.keywords || DEFAULT_KEYWORDS;
-        const maxResults = args.maxResults ?? 20;
-        const startTime = new Date().toISOString();
-
-        const state = await loadState(ctx.repoDir);
-        const checkedIds = new Set(state.checkedCves);
-
-        const [ubiquitiData, nvdData, ghData] = await Promise.all([
-          queryUbiquitiBulletins(
-            maxResults,
-            args.currentProduct,
-            args.currentVersion,
-          ),
-          queryNvd(keywords, maxResults),
-          queryGithubAdvisories(keywords),
-        ]);
-
-        const byId = new Map<string, Finding>();
-        for (const cve of [...ubiquitiData, ...nvdData, ...ghData]) {
-          if (
-            !byId.has(cve.cve_id) || byId.get(cve.cve_id)?.source !== "UBIQUITI"
-          ) {
-            byId.set(cve.cve_id, cve);
-          }
+        "Current UniFi update inventory plus deduplicated review candidates, across Home Assistant and direct-observation sources",
+      schema: ReportSchema,
+      lifetime: "infinite",
+      garbageCollection: 52,
+    },
+  },
+  methods: {
+    scan: {
+      description:
+        "Read Home Assistant firmware-update entities and emit only new or scheduled 7/14/21-day review candidates for that source. Does not install updates. Leaves any direct-observation entries untouched.",
+      arguments: z.object({}),
+      execute: async (_args: Record<string, never>, ctx: MethodContext) => {
+        const { homeAssistantUrl, homeAssistantToken, entityIds } =
+          ctx.globalArgs;
+        if (!homeAssistantUrl || !homeAssistantToken || !entityIds?.length) {
+          throw new Error(
+            "scan requires homeAssistantUrl, homeAssistantToken, and at least one entityId to be configured on this model instance",
+          );
+        }
+        const now = new Date();
+        const nowIso = now.toISOString();
+        ctx.logger.info("Reading Home Assistant firmware update entities");
+        const base = homeAssistantUrl.replace(/\/$/, "");
+        const response = await fetch(`${base}/api/states`, {
+          headers: {
+            Authorization: `Bearer ${homeAssistantToken}`,
+            Accept: "application/json",
+          },
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!response.ok) {
+          throw new Error(
+            `Home Assistant states request failed with HTTP ${response.status}`,
+          );
+        }
+        const states: unknown = await response.json();
+        if (!Array.isArray(states)) {
+          throw new Error("Home Assistant states response was not an array");
         }
 
-        const allInScope = [...byId.values()].filter((cve) =>
-          cve.severity === "HIGH" || cve.severity === "CRITICAL"
+        const prior = ReportSchema.nullable().parse(
+          await ctx.readResource!("release-safety-current"),
         );
-        const newUncheckedCves = allInScope.filter((cve) =>
-          !checkedIds.has(cve.cve_id)
+        const priorByKey = new Map(
+          (prior?.availableUpdates ?? []).map((
+            release,
+          ) => [release.key, release]),
         );
-        const alertText = formatAlert(newUncheckedCves, startTime);
+        const firmwareStates = states.filter((item): item is HaState =>
+          typeof item === "object" && item !== null &&
+          typeof (item as HaState).entity_id === "string" &&
+          entityIds.includes((item as HaState).entity_id as string)
+        );
+        const current = firmwareStates
+          .map((item) => firmwareUpdateFromState(item, nowIso))
+          .filter((item): item is Release => item !== undefined)
+          .map((release) => {
+            const previous = priorByKey.get(release.key);
+            return previous ? { ...previous, lastSeenAt: nowIso } : release;
+          })
+          .sort((a, b) => a.key.localeCompare(b.key));
 
-        const allIds = [
-          ...new Set([
-            ...state.checkedCves,
-            ...allInScope.map((c) => c.cve_id),
-          ]),
-        ]
+        const reviewCandidates = reviewCandidatesFor(current, now);
+
+        const priorDirectReleases = (prior?.availableUpdates ?? []).filter((
+          release,
+        ) => release.source === "direct");
+        const availableUpdates = [...current, ...priorDirectReleases].sort((
+          a,
+          b,
+        ) => a.key.localeCompare(b.key));
+
+        const priorHaKeys = new Set(
+          (prior?.availableUpdates ?? [])
+            .filter((release) => release.source === "homeAssistant")
+            .map((release) => release.key),
+        );
+        const currentKeys = new Set(current.map((release) => release.key));
+        const staleReleaseKeys = [...priorHaKeys]
+          .filter((key) => !currentKeys.has(key))
           .sort();
-        await saveState(ctx.repoDir, {
-          lastCheck: startTime,
-          checkedCves: allIds,
+
+        const summary = reviewCandidates.length === 0
+          ? "No new or scheduled UniFi firmware safety reviews are due."
+          : `${reviewCandidates.length} UniFi firmware safety review(s) due.`;
+        const report: Report = {
+          scannedAt: nowIso,
+          firmwareEntitiesScanned: firmwareStates.length,
+          availableUpdates,
+          reviewCandidates,
+          staleReleaseKeys,
+          summary,
+        };
+        const handle = await ctx.writeResource(
+          "releaseSafetyReport",
+          "release-safety-current",
+          report,
+        );
+        ctx.logger.info("Completed firmware update scan: {*}", {
+          firmwareEntitiesScanned: firmwareStates.length,
+          availableUpdates: current.length,
+          reviewCandidates: reviewCandidates.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    observe: {
+      description:
+        "Record caller-supplied model/installed-version/target-version observations (no Home Assistant required) and emit only new or scheduled 7/14/21-day review candidates for that source. Performs no network request and does not install updates. Leaves any Home Assistant-sourced entries untouched.",
+      arguments: ObserveArgs,
+      execute: async (
+        args: z.infer<typeof ObserveArgs>,
+        ctx: MethodContext,
+      ) => {
+        const now = new Date();
+        const nowIso = now.toISOString();
+        ctx.logger.info("Recording direct-observation firmware entries: {*}", {
+          observations: args.observations.length,
         });
 
-        return {
-          dataHandles: [
-            await ctx.writeResource("results", "scan", {
-              alertText,
-              newCVEs: newUncheckedCves,
-              totalScanned: allInScope.length,
-              timestamp: startTime,
-            }),
-          ],
+        const prior = ReportSchema.nullable().parse(
+          await ctx.readResource!("release-safety-current"),
+        );
+        const priorByKey = new Map(
+          (prior?.availableUpdates ?? []).map((
+            release,
+          ) => [release.key, release]),
+        );
+        const current = args.observations
+          .map((entry) => directObservationRelease(entry, nowIso))
+          .filter((item): item is Release => item !== undefined)
+          .map((release) => {
+            const previous = priorByKey.get(release.key);
+            return previous ? { ...previous, lastSeenAt: nowIso } : release;
+          })
+          .sort((a, b) => a.key.localeCompare(b.key));
+
+        const reviewCandidates = reviewCandidatesFor(current, now);
+
+        const priorOtherReleases = (prior?.availableUpdates ?? []).filter((
+          release,
+        ) => release.source !== "direct");
+        const availableUpdates = [...priorOtherReleases, ...current].sort((
+          a,
+          b,
+        ) => a.key.localeCompare(b.key));
+
+        const priorDirectKeys = new Set(
+          (prior?.availableUpdates ?? [])
+            .filter((release) => release.source === "direct")
+            .map((release) => release.key),
+        );
+        const currentKeys = new Set(current.map((release) => release.key));
+        const staleReleaseKeys = [...priorDirectKeys]
+          .filter((key) => !currentKeys.has(key))
+          .sort();
+
+        const summary = reviewCandidates.length === 0
+          ? "No new or scheduled UniFi firmware safety reviews are due."
+          : `${reviewCandidates.length} UniFi firmware safety review(s) due.`;
+        const report: Report = {
+          scannedAt: nowIso,
+          directObservationsRecorded: args.observations.length,
+          availableUpdates,
+          reviewCandidates,
+          staleReleaseKeys,
+          summary,
         };
+        const handle = await ctx.writeResource(
+          "releaseSafetyReport",
+          "release-safety-current",
+          report,
+        );
+        ctx.logger.info("Completed direct-observation recording: {*}", {
+          observationsRecorded: args.observations.length,
+          availableUpdates: current.length,
+          reviewCandidates: reviewCandidates.length,
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+    acknowledge: {
+      description:
+        "Record completed delivery of one or more research reports so the same firmware stage is not re-notified. Works for both Home Assistant and direct-observation entries.",
+      arguments: AcknowledgementArgs,
+      execute: async (
+        args: z.infer<typeof AcknowledgementArgs>,
+        ctx: MethodContext,
+      ) => {
+        const prior = ReportSchema.nullable().parse(
+          await ctx.readResource!("release-safety-current"),
+        );
+        if (!prior) {
+          throw new Error("No release-safety report exists to acknowledge");
+        }
+        const acknowledgements = new Map(
+          args.acknowledgements.map((item) => [item.key, item.stage]),
+        );
+        const now = new Date();
+        for (const acknowledgement of args.acknowledgements) {
+          const release = prior.availableUpdates.find(
+            (candidate) => candidate.key === acknowledgement.key,
+          );
+          if (!release) {
+            throw new Error(
+              `Acknowledgement key is not in the current release report: ${acknowledgement.key}`,
+            );
+          }
+          const dueStage = stageDue(release, now);
+          if (dueStage !== acknowledgement.stage) {
+            throw new Error(
+              `Acknowledgement stage ${acknowledgement.stage} is not currently due for ${acknowledgement.key}`,
+            );
+          }
+        }
+        const availableUpdates = prior.availableUpdates.map((release) => {
+          const stage = acknowledgements.get(release.key);
+          if (!stage) return release;
+          const upcoming = nextStage(stage);
+          const nextReviewAt = upcoming
+            ? isoAfter(release.firstSeenAt, REVIEW_DAYS[upcoming])
+            : undefined;
+          return { ...release, lastNotifiedStage: stage, nextReviewAt };
+        });
+        const acknowledgedKeys = new Set(
+          availableUpdates
+            .filter((release) => acknowledgements.has(release.key))
+            .map((release) => release.key),
+        );
+        if (acknowledgedKeys.size !== acknowledgements.size) {
+          throw new Error(
+            "One or more acknowledgement keys were not in the current release report",
+          );
+        }
+        const report: Report = {
+          ...prior,
+          scannedAt: new Date().toISOString(),
+          availableUpdates,
+          reviewCandidates: [],
+          summary:
+            `Recorded delivery for ${acknowledgedKeys.size} UniFi firmware safety review(s).`,
+        };
+        const handle = await ctx.writeResource(
+          "releaseSafetyReport",
+          "release-safety-current",
+          report,
+        );
+        ctx.logger.info("Recorded delivered firmware safety reviews: {*}", {
+          acknowledgements: acknowledgedKeys.size,
+        });
+        return { dataHandles: [handle] };
       },
     },
   },
