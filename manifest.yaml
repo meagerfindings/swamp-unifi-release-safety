@@ -1,12 +1,13 @@
 manifestVersion: 1
 name: "@mgreten/unifi-release-safety"
-version: "2026.07.20.1"
+version: "2026.10.14.1"
 description: >
   Read-only UniFi firmware release observation through an optional Home
   Assistant collector or caller-supplied model/version observations.
   Deduplicates transitions and schedules initial plus 7/14/21-day evidence
   reviews without installing updates.
 repository: https://github.com/meagerfindings/swamp-unifi-release-safety
+license: MIT
 
 paths:
   base: manifest
